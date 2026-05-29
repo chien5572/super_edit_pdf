@@ -16,6 +16,73 @@ from PySide6.QtWidgets import (
 def natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
 
+# Automatic black border detection
+def detect_black_borders(qimage):
+    # Scale down to speed up pixel analysis (about 100x130 or 150x200 is fast)
+    analyze_w = 150
+    analyze_h = 200
+    scaled = qimage.scaled(analyze_w, analyze_h, Qt.IgnoreAspectRatio, Qt.FastTransformation)
+    
+    W = scaled.width()
+    H = scaled.height()
+    
+    # Threshold for dark pixels
+    def is_dark(color):
+        return color.red() < 65 and color.green() < 65 and color.blue() < 65
+
+    # Max scan limits (20% of dimension to avoid text cropping)
+    max_scan_w = W // 5
+    max_scan_h = H // 5
+    
+    left = 0
+    for x in range(max_scan_w):
+        dark_count = 0
+        for y in range(H):
+            if is_dark(scaled.pixelColor(x, y)):
+                dark_count += 1
+        if dark_count / H >= 0.15:
+            left = x + 1
+        else:
+            break
+            
+    right = 0
+    for x in range(max_scan_w):
+        col = W - 1 - x
+        dark_count = 0
+        for y in range(H):
+            if is_dark(scaled.pixelColor(col, y)):
+                dark_count += 1
+        if dark_count / H >= 0.15:
+            right = x + 1
+        else:
+            break
+            
+    top = 0
+    for y in range(max_scan_h):
+        dark_count = 0
+        for x in range(W):
+            if is_dark(scaled.pixelColor(x, y)):
+                dark_count += 1
+        if dark_count / W >= 0.15:
+            top = y + 1
+        else:
+            break
+            
+    bottom = 0
+    for y in range(max_scan_h):
+        row = H - 1 - y
+        dark_count = 0
+        for x in range(W):
+            if is_dark(scaled.pixelColor(x, row)):
+                dark_count += 1
+        if dark_count / W >= 0.15:
+            bottom = y + 1
+        else:
+            break
+            
+    # Return border ratios (between 0.0 and 1.0)
+    return (left / W, top / H, right / W, bottom / H)
+
 # Background worker to load and render PDF pages to QImage (thread-safe)
 class PageLoadWorker(QThread):
     page_loaded = Signal(int, QImage, dict)  # (global_page_idx, qimage, page_info)
@@ -106,6 +173,7 @@ class PageWidget(QFrame):
     delete_requested = Signal(int)          # Emits page_id
     crop_requested = Signal(int)            # Emits page_id
     rotate_angle_requested = Signal(int)    # Emits page_id
+    clean_borders_requested = Signal(int)    # Emits page_id
 
     def __init__(self, page_info, target_width=200, parent=None):
         super().__init__(parent)
@@ -202,6 +270,14 @@ class PageWidget(QFrame):
         self.btn_rotate_angle.clicked.connect(lambda: self.rotate_angle_requested.emit(self.page_id))
         row2_layout.addWidget(self.btn_rotate_angle)
 
+        # Clean Borders Button
+        self.btn_clean_borders = QPushButton("🧹", self)
+        self.btn_clean_borders.setToolTip("Tự động xóa viền đen")
+        self.btn_clean_borders.setFixedSize(22, 18)
+        self.btn_clean_borders.setObjectName("btnControl")
+        self.btn_clean_borders.clicked.connect(lambda: self.clean_borders_requested.emit(self.page_id))
+        row2_layout.addWidget(self.btn_clean_borders)
+
         bottom_layout.addLayout(row2_layout)
 
         layout.addLayout(bottom_layout)
@@ -213,15 +289,39 @@ class PageWidget(QFrame):
 
         # Rotate the cached QPixmap for display
         original_pixmap = self.page_info["pixmap"]
+        
+        # If white_borders is enabled, paint white rectangles on a copy of the original pixmap
+        white_borders = self.page_info.get("white_borders")
+        if white_borders:
+            temp_pixmap = original_pixmap.copy()
+            painter = QPainter(temp_pixmap)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(255, 255, 255))
+            
+            w = temp_pixmap.width()
+            h = temp_pixmap.height()
+            left_r, top_r, right_r, bottom_r = white_borders
+            
+            if left_r > 0:
+                painter.drawRect(0, 0, int(left_r * w), h)
+            if right_r > 0:
+                painter.drawRect(w - int(right_r * w), 0, int(right_r * w), h)
+            if top_r > 0:
+                painter.drawRect(0, 0, w, int(top_r * h))
+            if bottom_r > 0:
+                painter.drawRect(0, h - int(bottom_r * h), w, int(bottom_r * h))
+            painter.end()
+            disp_pixmap = temp_pixmap
+        else:
+            disp_pixmap = original_pixmap
+
         rotation_angle = self.page_info.get("rotation", 0)
         custom_angle = self.page_info.get("custom_angle", 0.0)
         total_angle = rotation_angle + custom_angle
 
         if total_angle != 0.0:
             transform = QTransform().rotate(total_angle)
-            disp_pixmap = original_pixmap.transformed(transform, Qt.SmoothTransformation)
-        else:
-            disp_pixmap = original_pixmap
+            disp_pixmap = disp_pixmap.transformed(transform, Qt.SmoothTransformation)
 
         # Scaled smoothly to the current target width matching grid mode selection
         scaled_pixmap = disp_pixmap.scaledToWidth(self.target_width, Qt.SmoothTransformation)
@@ -232,6 +332,7 @@ class PageWidget(QFrame):
         main_win = self.window()
         theme = getattr(main_win, "current_theme", "light")
         has_bp = self.page_info["has_breakpoint"]
+        has_wb = "white_borders" in self.page_info
 
         # Style difference for breakpoint active vs inactive based on active theme
         if theme == "dark":
@@ -248,6 +349,11 @@ class PageWidget(QFrame):
             else:
                 self.lbl_image.setStyleSheet("border: 1px solid #d1d1d6; border-radius: 4px; background-color: #ffffff;")
                 self.setStyleSheet("QWidget#PageWidget { border: 1px solid #d1d1d6; background-color: #ffffff; border-radius: 6px; }")
+
+        if has_wb:
+            self.btn_clean_borders.setStyleSheet("background-color: #34c759; color: white; border-color: #34c759;")
+        else:
+            self.btn_clean_borders.setStyleSheet("")
 
         self.update_display()
 
@@ -416,6 +522,22 @@ class PDFProcessor:
 
                     orig_idx = p_info["original_page_index"]
                     orig_page = src_doc[orig_idx]
+                    
+                    # Draw white borders on orig_page in memory if configured
+                    wb = p_info.get("white_borders")
+                    if wb:
+                        left_r, top_r, right_r, bottom_r = wb
+                        pdf_w = orig_page.rect.width
+                        pdf_h = orig_page.rect.height
+                        if left_r > 0:
+                            orig_page.draw_rect(fitz.Rect(0, 0, left_r * pdf_w, pdf_h), color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+                        if right_r > 0:
+                            orig_page.draw_rect(fitz.Rect(pdf_w - right_r * pdf_w, 0, pdf_w, pdf_h), color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+                        if top_r > 0:
+                            orig_page.draw_rect(fitz.Rect(0, 0, pdf_w, top_r * pdf_h), color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+                        if bottom_r > 0:
+                            orig_page.draw_rect(fitz.Rect(0, pdf_h - bottom_r * pdf_h, pdf_w, pdf_h), color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+
                     orig_rotation = orig_page.rotation
                     user_rotation = p_info.get("rotation", 0)
                     custom_angle = p_info.get("custom_angle", 0.0)
@@ -1222,6 +1344,7 @@ class PDFSplitterApp(QMainWindow):
         dir_path = QFileDialog.getExistingDirectory(self, "Chọn thư mục OUTPUT")
         if dir_path:
             self.txt_output.setText(dir_path)
+            self.update_tree_checkmarks()
 
     # Populates Tree containing only Box/Profile subfolders
     def populate_tree_model(self, input_dir):
@@ -1268,6 +1391,49 @@ class PDFSplitterApp(QMainWindow):
 
         # Expand top items by default
         self.tree_view.expandAll()
+        self.update_tree_checkmarks()
+
+    def update_tree_checkmarks(self):
+        input_dir = self.txt_input.text().strip()
+        output_dir = self.txt_output.text().strip()
+        if not input_dir or not os.path.exists(input_dir):
+            return
+
+        for row in range(self.tree_model.rowCount()):
+            box_item = self.tree_model.item(row)
+            if not box_item:
+                continue
+            for child_row in range(box_item.rowCount()):
+                dossier_item = box_item.child(child_row)
+                if not dossier_item:
+                    continue
+                dossier_path = dossier_item.data(Qt.UserRole)
+                if not dossier_path or not os.path.exists(dossier_path):
+                    continue
+
+                dossier_name = os.path.basename(dossier_path)
+                try:
+                    pdf_files = [f for f in os.listdir(dossier_path) if f.lower().endswith('.pdf')]
+                    pdf_tag = f" ({len(pdf_files)} file PDF)" if pdf_files else " (Trống)"
+                except Exception:
+                    pdf_tag = " (Trống)"
+
+                # Check if output exists and is not empty
+                has_output = False
+                if output_dir and os.path.exists(output_dir):
+                    rel_path = os.path.relpath(dossier_path, input_dir)
+                    target_output_dir = os.path.join(output_dir, rel_path)
+                    if os.path.exists(target_output_dir):
+                        try:
+                            if os.listdir(target_output_dir):
+                                has_output = True
+                        except Exception:
+                            pass
+
+                if has_output:
+                    dossier_item.setText(f"{dossier_name}{pdf_tag} ✅")
+                else:
+                    dossier_item.setText(f"{dossier_name}{pdf_tag}")
 
     # Toggle sidebar visibility
     def toggle_sidebar(self):
@@ -1321,6 +1487,8 @@ class PDFSplitterApp(QMainWindow):
 
         self.processor.clear()
         self.grid_widget.clear_grid()
+        self.scroll_area.verticalScrollBar().setValue(0)
+        self.scroll_area.horizontalScrollBar().setValue(0)
         self.lbl_status.setText("Đang tải dữ liệu...")
 
         self.load_worker = PageLoadWorker(dossier_path)
@@ -1345,6 +1513,7 @@ class PDFSplitterApp(QMainWindow):
         widget.delete_requested.connect(self.delete_page)
         widget.crop_requested.connect(self.open_crop_dialog)
         widget.rotate_angle_requested.connect(self.open_rotate_dialog)
+        widget.clean_borders_requested.connect(self.toggle_clean_borders)
 
         self.grid_widget.widgets.append(widget)
         widget.index = len(self.grid_widget.widgets) - 1
@@ -1417,6 +1586,35 @@ class PDFSplitterApp(QMainWindow):
                 continue
             if p["id"] == page_id:
                 self.grid_widget.widgets[visible_idx].update_display()
+                break
+            visible_idx += 1
+
+    def toggle_clean_borders(self, page_id):
+        # Find page info
+        page_info = None
+        for p in self.processor.pages:
+            if p["id"] == page_id:
+                page_info = p
+                break
+        if not page_info:
+            return
+            
+        if "white_borders" in page_info:
+            # Toggle off
+            del page_info["white_borders"]
+        else:
+            # Toggle on: detect borders
+            qimg = page_info["pixmap"].toImage()
+            ratios = detect_black_borders(qimg)
+            page_info["white_borders"] = ratios
+            
+        # Update matching widget
+        visible_idx = 0
+        for p in self.processor.pages:
+            if p["is_deleted"]:
+                continue
+            if p["id"] == page_id:
+                self.grid_widget.widgets[visible_idx].update_state()
                 break
             visible_idx += 1
 
@@ -1631,6 +1829,7 @@ class PDFSplitterApp(QMainWindow):
         # Perform PDF splitting
         success, msg = self.processor.split_pdf(output_dir, hop_name, ho_so_name)
         if success:
+            self.update_tree_checkmarks()
             QMessageBox.information(self, "Thành công", msg)
         else:
             QMessageBox.critical(self, "Lỗi", f"Tách file PDF thất bại:\n{msg}")
