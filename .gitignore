@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Test data & temporary files
+test_input/
+output/
+
+# IDE files
+.vscode/
+.idea/
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
