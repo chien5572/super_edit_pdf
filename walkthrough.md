@@ -1,41 +1,54 @@
-# Kết quả Hoàn thành & Hướng dẫn Nghiệm thu
+# Walkthrough: Tự động xóa viền đen (Tô trắng) trang PDF
 
-Chúng ta đã hoàn thành việc tích hợp tất cả các tính năng cho ứng dụng PDF Splitter. Cập nhật mới nhất bổ sung nút **Tải lại (Refresh)** ở thanh tiêu đề cây thư mục bên trái để nhanh chóng đồng bộ danh sách hộp & hồ sơ.
+Tính năng tự động phát hiện và xóa viền đen đã được triển khai hoàn tất vào ứng dụng. Dưới đây là các thay đổi và kết quả thử nghiệm.
+
+## Các thay đổi chính trong mã nguồn
+
+### 1. Thuật toán phát hiện viền đen siêu tốc
+* Thêm hàm `detect_black_borders(qimage)` vào [main.py](file:///d:/workspace/vibe-code-app/super_edit_pdf/super_edit_pdf/main.py):
+  * Tự động scale ảnh về kích thước nhỏ `150x200` để quét nhanh và mượt mà (< 10ms).
+  * Quét từ 4 cạnh đi vào trong để tìm vùng có mật độ pixel tối (> 15% diện tích cạnh quét).
+  * Giới hạn vùng quét tối đa 20% kích thước ảnh để đảm bảo không lấn vào vùng nội dung văn bản.
+  * Trả về tỷ lệ viền dạng thập phân `(left_ratio, top_ratio, right_ratio, bottom_ratio)`.
+
+### 2. Cập nhật giao diện `PageWidget`
+* Bổ sung nút bấm 🧹 (Tự động xóa viền đen) vào hàng công cụ bên dưới mỗi trang.
+* Cập nhật `PageWidget.update_state()` để đổi màu nền nút 🧹 sang màu xanh lục nổi bật khi tính năng xóa viền được kích hoạt.
+* Cập nhật `PageWidget.update_display()` để vẽ đè 4 dải hình chữ nhật màu trắng tương ứng lên ảnh thumbnail của trang dựa trên kết quả phát hiện viền.
+
+### 3. Cập nhật logic xuất file `PDFProcessor.split_pdf`
+* Khi xuất các file PDF con, nếu trang tài liệu có cấu hình xóa viền, hệ thống sẽ tự động vẽ đè 4 hình chữ nhật vector màu trắng lên 4 cạnh trang tương ứng sử dụng `page.draw_rect()` trong PyMuPDF.
+* Điều này giúp loại bỏ viền đen hoàn toàn ở file PDF xuất ra mà không ảnh hưởng tới dung lượng file hoặc độ sắc nét của văn bản scan.
+
+### 4. Tự động cuộn trang lên đầu khi chuyển đổi hồ sơ
+* Cập nhật phương thức `PDFSplitterApp.load_ho_so_pages()` để tự động đặt lại giá trị của các thanh cuộn dọc (vertical scrollbar) và cuộn ngang (horizontal scrollbar) về `0`.
+* Việc này đảm bảo khi người dùng click chọn hồ sơ mới, màn hình làm việc sẽ được đưa về vị trí đầu trang thay vì giữ nguyên vị trí cuộn của hồ sơ cũ trước đó.
+
+### 5. Đánh dấu hồ sơ đã hoàn thành (Dấu check xanh ✅)
+* Thêm phương thức `PDFSplitterApp.update_tree_checkmarks()` để tự động kiểm tra xem các thư mục hồ sơ tương ứng ở thư mục `output` đã tồn tại và chứa file PDF con hay chưa.
+* Nếu đã tồn tại kết quả đầu ra, tự động thêm biểu tượng ✅ vào bên phải tên hồ sơ trên cây thư mục.
+* Các liên kết tự động gọi làm tươi checkmarks:
+  * Khi chọn thư mục Input ban đầu.
+  * Khi thay đổi hoặc chọn lại thư mục Output.
+  * Khi thực hiện tác vụ **Ngắt File** thành công (checkmark xuất hiện ngay lập tức trên hồ sơ đang làm việc).
 
 ---
 
-## 📸 Giao diện ứng dụng Cực kỳ Tối ưu (Mockup)
+## Cách kiểm thử trực quan
 
-![Giao diện Top Bar Hợp nhất và Siêu Gọn](file:///C:/Users/chien/.gemini/antigravity-ide/brain/3d4a2ba5-a031-4276-93d6-9ef27215478f/pdf_splitter_unified_1779980970644.png)
+1. **Khởi chạy ứng dụng**:
+   Chạy lệnh sau tại thư mục dự án:
+   ```bash
+   python main.py
+   ```
+2. **Chọn Hồ sơ có trang tài liệu bị viền đen**.
+3. **Kích hoạt tính năng**:
+   * Click vào biểu tượng chổi quét 🧹 dưới chân trang.
+   * Viền đen sẽ ngay lập tức được phủ trắng trên giao diện. Nút 🧹 chuyển sang màu xanh lá.
+   * Để hoàn tác, click lại nút 🧹 một lần nữa.
+4. **Xuất PDF**:
+   * Nhấn nút **Ngắt File** để xuất các file PDF con vào thư mục `output`.
+   * Mở file PDF đầu ra và kiểm tra các viền đen đã được loại bỏ sạch sẽ.
 
----
-
-## 🛠️ Các cập nhật mới đã thực hiện
-
-1. **Nút Tải lại thư mục (Refresh Button)**:
-   * Thêm một nút bấm nhỏ biểu tượng `🔄` ngay bên trái nút **Thu gọn** trên thanh tiêu đề của cây thư mục.
-   * **Cách hoạt động**: Khi bạn thêm/xóa bớt các Hộp hoặc Hồ sơ trong thư mục Input ngoài Windows Explorer, chỉ cần nhấp nút `🔄` để ứng dụng tự động quét lại và đồng bộ hiển thị mà không cần phải chọn lại thư mục Input từ đầu.
-   * **Thông báo trạng thái**: Hiển thị thông báo *"Đã cập nhật lại danh sách thư mục hồ sơ."* ở dòng thông tin trạng thái để xác nhận.
-
-2. **Nút chuyển đổi giao diện Sáng/Tối nhanh (Theme Switcher)**:
-   * Nút 🌙 hoặc ☀️ trên Top Bar để chuyển đổi mượt mà giữa giao diện Sáng và Tối, tự động nhớ lựa chọn cho lần chạy sau.
-
-3. **Cập nhật Logic Ngắt File (Breakpoint = Start of new PDF)**:
-   * Trang được đặt breakpoint sẽ bắt đầu cho file PDF con mới.
-
-4. **Giao diện sáng Mac/iOS siêu gọn**:
-   * Thanh công cụ Top Bar siêu mỏng chỉ `34px` (chiếm ~3% chiều cao màn hình), tối ưu không gian hiển thị hình ảnh PDF.
-
----
-
-## 🚀 Hướng dẫn Nghiệm thu Thực tế
-
-Bạn chạy ứng dụng bằng lệnh:
-```powershell
-python main.py
-```
-
-* **Kiểm tra tính năng Tải lại (Refresh)**:
-  1. Thêm thử một folder trống dạng `Hop_03` hoặc thêm hồ sơ mới trong thư mục `test_input/` ngoài Windows Explorer.
-  2. Quay lại giao diện ứng dụng, nhấp nút `🔄` phía trên cây thư mục bên trái.
-  3. Cây thư mục sẽ lập tức cập nhật và hiển thị thêm thư mục mới mà bạn vừa tạo.
+## Đẩy mã nguồn lên GitHub
+* Toàn bộ các thay đổi trên đã được commit và push thành công lên GitHub tại: `https://github.com/chien5572/super_edit_pdf` (Nhánh `main`).

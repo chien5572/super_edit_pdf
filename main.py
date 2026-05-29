@@ -89,9 +89,10 @@ class PageLoadWorker(QThread):
     finished = Signal()
     progress_status = Signal(str)
 
-    def __init__(self, ho_so_path):
+    def __init__(self, ho_so_path, dpi=100):
         super().__init__()
         self.ho_so_path = ho_so_path
+        self.dpi = dpi
         self._is_cancelled = False
 
     def cancel(self):
@@ -132,8 +133,8 @@ class PageLoadWorker(QThread):
                         break
 
                     page = doc[page_idx]
-                    # Render page at 150 DPI for high quality layout view
-                    zoom = 150 / 72
+                    # Render page at 72 DPI (zoom=1.0)
+                    zoom = 1.0
                     mat = fitz.Matrix(zoom, zoom)
                     pix = page.get_pixmap(matrix=mat, alpha=False)
 
@@ -146,6 +147,9 @@ class PageLoadWorker(QThread):
                         pix.stride,
                         QImage.Format_RGB888
                     ).copy()
+
+                    if qimg.width() > 300:
+                        qimg = qimg.scaledToWidth(300, Qt.SmoothTransformation)
 
                     page_info = {
                         "source_pdf": pdf_path,
@@ -164,6 +168,85 @@ class PageLoadWorker(QThread):
                 print(f"Error loading PDF {pdf_path}: {e}")
 
         self.finished.emit()
+
+
+class CachePageLoadWorker(QThread):
+    dossier_loaded = Signal(str, list)  # (dossier_path, list of (global_page_idx, qimage, page_info))
+
+    def __init__(self, dossier_paths, dpi=100):
+        super().__init__()
+        self.dossier_paths = dossier_paths
+        self.dpi = dpi
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        for dossier_path in self.dossier_paths:
+            if self._is_cancelled:
+                break
+
+            try:
+                files = sorted(
+                    [f for f in os.listdir(dossier_path) if f.lower().endswith('.pdf')],
+                    key=natural_sort_key
+                )
+            except Exception:
+                continue
+
+            if not files:
+                continue
+
+            dossier_pages = []
+            global_page_idx = 0
+
+            for file in files:
+                if self._is_cancelled:
+                    break
+                pdf_path = os.path.join(dossier_path, file)
+                try:
+                    doc = fitz.open(pdf_path)
+                    num_pages = len(doc)
+                    for page_idx in range(num_pages):
+                        if self._is_cancelled:
+                            break
+                        page = doc[page_idx]
+                        # Render page at 72 DPI (zoom=1.0)
+                        zoom = 1.0
+                        mat = fitz.Matrix(zoom, zoom)
+                        pix = page.get_pixmap(matrix=mat, alpha=False)
+
+                        qimg = QImage(
+                            pix.samples,
+                            pix.width,
+                            pix.height,
+                            pix.stride,
+                            QImage.Format_RGB888
+                        ).copy()
+
+                        if qimg.width() > 300:
+                            qimg = qimg.scaledToWidth(300, Qt.SmoothTransformation)
+
+                        page_info = {
+                            "source_pdf": pdf_path,
+                            "original_page_index": page_idx,
+                            "rotation": 0,
+                            "custom_angle": 0.0,
+                            "is_deleted": False,
+                            "has_breakpoint": False
+                        }
+                        dossier_pages.append((global_page_idx, qimg, page_info))
+                        global_page_idx += 1
+                    doc.close()
+                except Exception:
+                    pass
+
+            if self._is_cancelled:
+                break
+
+            if dossier_pages:
+                self.dossier_loaded.emit(dossier_path, dossier_pages)
 
 
 # Individual widget representing a single PDF page
@@ -469,7 +552,7 @@ class PDFProcessor:
         self.pages = []  # List of page_info dicts representing the dossier state
 
     def clear(self):
-        self.pages.clear()
+        self.pages = []
 
     def reorder_pages(self, src_visible_idx, dst_visible_idx):
         # Convert visible index mapping to actual page index in the full list
@@ -1135,6 +1218,9 @@ class PDFSplitterApp(QMainWindow):
         # Core logic components
         self.processor = PDFProcessor()
         self.load_worker = None
+        self.caching_worker = None
+        self.current_dpi = 100
+        self.dossier_cache = {}  # dossier_path -> {"dpi": int, "pages": list, "size_bytes": int}
         self.current_hop_name = ""
         self.current_ho_so_name = ""
         self.current_ho_so_path = ""
@@ -1219,6 +1305,19 @@ class PDFSplitterApp(QMainWindow):
         self.cb_grid_mode.setFixedWidth(50)
         top_bar_layout.addWidget(lbl_grid)
         top_bar_layout.addWidget(self.cb_grid_mode)
+
+        top_bar_layout.addWidget(self.create_v_line())
+
+        # DPI Mode Selector
+        lbl_dpi = QLabel("DPI:", self)
+        lbl_dpi.setStyleSheet("font-weight: bold;")
+        self.cb_dpi_mode = QComboBox(self)
+        self.cb_dpi_mode.addItems(["100 DPI", "150 DPI", "200 DPI", "300 DPI"])
+        self.cb_dpi_mode.setCurrentText("100 DPI")
+        self.cb_dpi_mode.currentTextChanged.connect(self.change_dpi_mode)
+        self.cb_dpi_mode.setFixedWidth(75)
+        top_bar_layout.addWidget(lbl_dpi)
+        top_bar_layout.addWidget(self.cb_dpi_mode)
 
         top_bar_layout.addWidget(self.create_v_line())
 
@@ -1338,13 +1437,17 @@ class PDFSplitterApp(QMainWindow):
         dir_path = QFileDialog.getExistingDirectory(self, "Chọn thư mục INPUT")
         if dir_path:
             self.txt_input.setText(dir_path)
+            self.dossier_cache.clear()
             self.populate_tree_model(dir_path)
+            self.start_background_caching()
 
     def browse_output(self):
         dir_path = QFileDialog.getExistingDirectory(self, "Chọn thư mục OUTPUT")
         if dir_path:
             self.txt_output.setText(dir_path)
+            self.dossier_cache.clear()
             self.update_tree_checkmarks()
+            self.start_background_caching()
 
     # Populates Tree containing only Box/Profile subfolders
     def populate_tree_model(self, input_dir):
@@ -1452,6 +1555,7 @@ class PDFSplitterApp(QMainWindow):
         if input_dir and os.path.exists(input_dir):
             self.populate_tree_model(input_dir)
             self.lbl_status.setText("Đã cập nhật lại danh sách thư mục hồ sơ.")
+            self.start_background_caching()
 
     # Handles folder selection in sidebar
     def on_tree_clicked(self, index):
@@ -1480,6 +1584,40 @@ class PDFSplitterApp(QMainWindow):
 
     # Dispatches thread to load pages asynchronously
     def load_ho_so_pages(self, dossier_path):
+        # 1. Check if the dossier is already cached at the current DPI
+        if dossier_path in self.dossier_cache and self.dossier_cache[dossier_path]["dpi"] == self.current_dpi:
+            cache_entry = self.dossier_cache[dossier_path]
+            self.processor.pages = cache_entry["pages"]
+            self.grid_widget.clear_grid()
+            self.scroll_area.verticalScrollBar().setValue(0)
+            self.scroll_area.horizontalScrollBar().setValue(0)
+
+            cols, width = GRID_MODES[self.current_grid_mode]
+            for idx, page_info in enumerate(self.processor.pages):
+                page_info["id"] = idx
+                widget = PageWidget(page_info, target_width=width, parent=self.grid_widget)
+                widget.clicked.connect(self.toggle_breakpoint)
+                widget.rotate_requested.connect(self.rotate_page)
+                widget.delete_requested.connect(self.delete_page)
+                widget.crop_requested.connect(self.open_crop_dialog)
+                widget.rotate_angle_requested.connect(self.open_rotate_dialog)
+                widget.clean_borders_requested.connect(self.toggle_clean_borders)
+
+                self.grid_widget.widgets.append(widget)
+                widget.index = len(self.grid_widget.widgets) - 1
+                widget.update_state()
+
+                row = widget.index // self.grid_widget.columns
+                col = widget.index % self.grid_widget.columns
+                self.grid_widget.grid_layout.addWidget(widget, row, col)
+
+            total_loaded = len([p for p in self.processor.pages if not p["is_deleted"]])
+            self.lbl_status.setText(f"[RAM Cache] Đã tải xong {total_loaded} trang.")
+            return
+
+        # 2. If not cached, stop background pre-caching temporarily to prioritize user loading
+        self.stop_caching_worker()
+
         # Terminate any running loader thread first
         if self.load_worker and self.load_worker.isRunning():
             self.load_worker.cancel()
@@ -1491,7 +1629,7 @@ class PDFSplitterApp(QMainWindow):
         self.scroll_area.horizontalScrollBar().setValue(0)
         self.lbl_status.setText("Đang tải dữ liệu...")
 
-        self.load_worker = PageLoadWorker(dossier_path)
+        self.load_worker = PageLoadWorker(dossier_path, dpi=self.current_dpi)
         self.load_worker.page_loaded.connect(self.handle_page_loaded)
         self.load_worker.progress_status.connect(self.lbl_status.setText)
         self.load_worker.finished.connect(self.handle_load_finished)
@@ -1526,6 +1664,128 @@ class PDFSplitterApp(QMainWindow):
     def handle_load_finished(self):
         total_loaded = len([p for p in self.processor.pages if not p["is_deleted"]])
         self.lbl_status.setText(f"Đã tải xong {total_loaded} trang. Nhấn vào ảnh để đặt điểm ngắt, kéo thả để đổi thứ tự.")
+        
+        # Cache the loaded dossier
+        if self.current_ho_so_path:
+            self.add_to_cache(self.current_ho_so_path, self.current_dpi, self.processor.pages)
+            
+        # Restart background caching for other uncompleted dossiers
+        self.start_background_caching()
+
+    def change_dpi_mode(self, text):
+        dpi = int(text.split()[0])
+        if dpi == self.current_dpi:
+            return
+            
+        self.current_dpi = dpi
+        # Clear the cache
+        self.dossier_cache.clear()
+        
+        # Reload active dossier if loaded
+        if self.current_ho_so_path:
+            self.load_ho_so_pages(self.current_ho_so_path)
+            
+        # Restart caching worker
+        self.start_background_caching()
+
+    def get_cache_size(self):
+        return sum(entry["size_bytes"] for entry in self.dossier_cache.values())
+
+    def add_to_cache(self, dossier_path, dpi, pages):
+        if not dossier_path:
+            return
+            
+        # Calculate size of pages
+        size_bytes = 0
+        for p in pages:
+            pix = p.get("pixmap")
+            if pix:
+                size_bytes += pix.width() * pix.height() * 4
+                
+        # Evict old entries if we exceed 2 GB
+        limit = 2000 * 1024 * 1024  # 2 GB
+        while len(self.dossier_cache) > 0 and (self.get_cache_size() + size_bytes) > limit:
+            # Remove first (oldest) entry
+            oldest_key = list(self.dossier_cache.keys())[0]
+            del self.dossier_cache[oldest_key]
+            
+        self.dossier_cache[dossier_path] = {
+            "dpi": dpi,
+            "pages": pages,
+            "size_bytes": size_bytes
+        }
+
+    def start_background_caching(self):
+        # Stop existing caching worker first
+        self.stop_caching_worker()
+        
+        input_dir = self.txt_input.text().strip()
+        output_dir = self.txt_output.text().strip()
+        if not input_dir or not os.path.exists(input_dir):
+            return
+            
+        # Traverse tree view to find all uncompleted dossiers
+        uncompleted_dossiers = []
+        
+        for row in range(self.tree_model.rowCount()):
+            box_item = self.tree_model.item(row)
+            if not box_item:
+                continue
+            for child_row in range(box_item.rowCount()):
+                dossier_item = box_item.child(child_row)
+                if not dossier_item:
+                    continue
+                dossier_path = dossier_item.data(Qt.UserRole)
+                if not dossier_path or not os.path.exists(dossier_path):
+                    continue
+                    
+                # Check if it has a checkmark or output
+                has_output = False
+                if output_dir and os.path.exists(output_dir):
+                    rel_path = os.path.relpath(dossier_path, input_dir)
+                    target_output_dir = os.path.join(output_dir, rel_path)
+                    if os.path.exists(target_output_dir):
+                        try:
+                            if os.listdir(target_output_dir):
+                                has_output = True
+                        except Exception:
+                            pass
+                
+                # Check if it's already cached with the current DPI
+                is_cached = dossier_path in self.dossier_cache and self.dossier_cache[dossier_path]["dpi"] == self.current_dpi
+                
+                if not has_output and not is_cached:
+                    uncompleted_dossiers.append(dossier_path)
+                    
+        if not uncompleted_dossiers:
+            return
+            
+        # Start caching thread
+        self.caching_worker = CachePageLoadWorker(uncompleted_dossiers, self.current_dpi)
+        self.caching_worker.dossier_loaded.connect(self.handle_dossier_cached)
+        self.caching_worker.start()
+
+    def stop_caching_worker(self):
+        if hasattr(self, "caching_worker") and self.caching_worker and self.caching_worker.isRunning():
+            self.caching_worker.cancel()
+            self.caching_worker.wait()
+        self.caching_worker = None
+
+    def handle_dossier_cached(self, dossier_path, dossier_pages):
+        # Stop background caching if cache size is already full
+        if self.get_cache_size() >= 2000 * 1024 * 1024:
+            self.stop_caching_worker()
+            return
+            
+        # Convert QImage to QPixmap on GUI thread
+        pages = []
+        for idx, qimg, page_info in dossier_pages:
+            pixmap = QPixmap.fromImage(qimg)
+            page_info["pixmap"] = pixmap
+            page_info["id"] = idx
+            pages.append(page_info)
+            
+        self.add_to_cache(dossier_path, self.current_dpi, pages)
 
     # Grid mode switching logic
     def change_grid_mode(self, mode_name):
@@ -1668,8 +1928,8 @@ class PDFSplitterApp(QMainWindow):
             pdf_w = page.rect.width
             pdf_h = page.rect.height
             
-            # Render at 150 DPI for sharp full screen view
-            zoom = 150 / 72
+            # Render at selected DPI for sharp full screen view
+            zoom = self.current_dpi / 72
             mat = fitz.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=mat, alpha=False)
             
@@ -1712,7 +1972,7 @@ class PDFSplitterApp(QMainWindow):
         try:
             doc = fitz.open(page_info["source_pdf"])
             page = doc[page_info["original_page_index"]]
-            zoom = 150 / 72
+            zoom = 1.0  # 72 DPI (zoom=1.0)
             mat = fitz.Matrix(zoom, zoom)
             
             c = page_info.get("crop_rect")
@@ -1723,6 +1983,8 @@ class PDFSplitterApp(QMainWindow):
                 pix = page.get_pixmap(matrix=mat, alpha=False)
                 
             qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888).copy()
+            if qimg.width() > 300:
+                qimg = qimg.scaledToWidth(300, Qt.SmoothTransformation)
             pixmap = QPixmap.fromImage(qimg)
             doc.close()
             return pixmap
@@ -1749,8 +2011,8 @@ class PDFSplitterApp(QMainWindow):
             pdf_w = page.rect.width
             pdf_h = page.rect.height
             
-            # Render at 150 DPI for sharp full screen view
-            zoom = 150 / 72
+            # Render at selected DPI for sharp full screen view
+            zoom = self.current_dpi / 72
             mat = fitz.Matrix(zoom, zoom)
             
             # If the page is cropped, render only the crop area.
@@ -1829,7 +2091,10 @@ class PDFSplitterApp(QMainWindow):
         # Perform PDF splitting
         success, msg = self.processor.split_pdf(output_dir, hop_name, ho_so_name)
         if success:
+            if self.current_ho_so_path in self.dossier_cache:
+                del self.dossier_cache[self.current_ho_so_path]
             self.update_tree_checkmarks()
+            self.start_background_caching()
             QMessageBox.information(self, "Thành công", msg)
         else:
             QMessageBox.critical(self, "Lỗi", f"Tách file PDF thất bại:\n{msg}")
